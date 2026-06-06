@@ -7,6 +7,7 @@ import functions from here and never use ``requests`` directly.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 
@@ -26,6 +27,24 @@ _HTTP_MAX_RETRIES = 2  # 首发之外再重试 2 次
 
 class FlightIOError(RuntimeError):
     """HTTP 调用最终失败时抛出。"""
+
+
+# ------------------------------------------------------------
+# heading 单位转换
+# 关键陷阱：simvar PLANE_HEADING_DEGREES_MAGNETIC 名字带 "DEGREES"，
+# 但 bridge/SimConnect 实际收发的是【弧度】（官方文档明确说明）。
+# 因此读出来要 rad→deg、写回去要 deg→rad；系统其余部分一律按"度"工作。
+# ------------------------------------------------------------
+
+
+def _heading_rad_to_deg(val: float) -> float:
+    """bridge 返回的 heading 是弧度，转成度并归一化到 [0, 360)。"""
+    return math.degrees(val) % 360.0
+
+
+def _heading_deg_to_rad(deg: float) -> float:
+    """写回 heading 时把度转成 simvar 期望的弧度。"""
+    return math.radians(deg)
 
 
 def set_flight_parameter(name: str, val) -> dict:
@@ -63,7 +82,9 @@ def read_state() -> dict:
                 data = resp.json()
                 state_dict = {item["name"]: item for item in data}
                 return {
-                    "heading": float(state_dict["PLANE_HEADING_DEGREES_MAGNETIC"]["val"]),
+                    "heading": _heading_rad_to_deg(
+                        float(state_dict["PLANE_HEADING_DEGREES_MAGNETIC"]["val"])
+                    ),
                     "altitude": float(state_dict["PLANE_ALTITUDE"]["val"]),
                     "raw": state_dict,
                     "timestamp": time.time(),
@@ -167,7 +188,7 @@ def reset_to(heading: float, altitude: float, settle_seconds: float = 5.0) -> No
     Raises:
         ResetVerificationError: 复位后状态超出容差
     """
-    set_flight_parameter("PLANE_HEADING_DEGREES_MAGNETIC", heading)
+    set_flight_parameter("PLANE_HEADING_DEGREES_MAGNETIC", _heading_deg_to_rad(heading))
     set_flight_parameter("PLANE_ALTITUDE", altitude)
     hover()
     time.sleep(settle_seconds)

@@ -124,15 +124,17 @@ action_time = clip(abs(control_raw) * 0.5,  min=0.1,  max=1.0)   # 单位：秒
 每个 run 之间必须把飞机回到一致的初始状态，否则 metric 不可比。
 
 ```
-1. set_flight_parameter("PLANE_HEADING_DEGREES_MAGNETIC", initial_heading)
+1. set_flight_parameter("PLANE_HEADING_DEGREES_MAGNETIC", deg→rad(initial_heading))  # heading 写回需转弧度
 2. set_flight_parameter("PLANE_ALTITUDE", initial_altitude)
 3. hover()                               # throttle=50, 舵面归零
 4. sleep(5 s)                            # 让 MSFS 物理稳态
-5. read_state() → 验证：heading 容差 ±5°, altitude 容差 ±50 ft
+5. read_state() → 验证：heading 容差 ±5°, altitude 容差 ±50 ft（read_state 已把读到的弧度转回度）
    超出容差则抛 ResetVerificationError，该 run 标记失败
 ```
 
 > **前提**：用户已确认 `PLANE_HEADING_DEGREES_MAGNETIC` 和 `PLANE_ALTITUDE` 通过现有 HTTP `set_flight_parameter` 接口可写。
+>
+> **单位陷阱**：`PLANE_HEADING_DEGREES_MAGNETIC` 名字带 "DEGREES" 但实际收发**弧度**（官方文档）。复位写入和验证读取的弧度↔度转换都封装在 `flight_io` 里，本表的 initial_heading / 容差仍按"度"理解。详见 `code_design.md` 4.1.1。
 
 ## 7. 时间预算
 

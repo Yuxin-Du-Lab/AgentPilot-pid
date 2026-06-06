@@ -85,6 +85,8 @@ def read_state() -> dict:
 
 实现方式：GET `API_URL_GET`，返回 JSON 是 simvar 列表（每项 `{name, val, unit, writable}`），转成 dict 后取需要的字段。读取失败重试 2 次，仍失败抛 `FlightIOError`。
 
+> **单位陷阱（heading 是弧度）**：simvar `PLANE_HEADING_DEGREES_MAGNETIC` 名字带 "DEGREES"，但 bridge/SimConnect 实际收发的是**弧度**（官方文档明确："although the name mentions degrees the units used are radians"）。所以 `read_state` 内部用 `_heading_rad_to_deg` 把读到的弧度转成度并归一化到 [0,360)，写回（见 4.1.3 `reset_to`）用 `_heading_deg_to_rad` 把度转成弧度。转换**只在 `flight_io` 这一层做**，对外（PID、experiment、metrics）heading 一律是"度"。`PLANE_ALTITUDE` 是英尺，无需转换。
+
 #### 4.1.2 控制指令（直接拷贝原 `flight_operations.py`）
 
 下列 7 个函数的函数体直接拷贝自原 `Pilot-FractFlow-main/tools/aircraft/msfs2024tools/flight_operations.py`，**仅做以下三点修改**：

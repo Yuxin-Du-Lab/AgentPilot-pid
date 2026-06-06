@@ -1,4 +1,5 @@
 import json
+import math
 import pytest
 from unittest.mock import patch, MagicMock
 from pid_exp import flight_io
@@ -49,8 +50,10 @@ def test_set_flight_parameter_raises_after_max_retries(monkeypatch):
         assert mock_put.call_count == 3
 
 
+# 注意：PLANE_HEADING_DEGREES_MAGNETIC 在 bridge 端是【弧度】（名字骗人），
+# 这里 val 用 95.5° 对应的弧度，read_state 应把它转回 95.5°。
 SAMPLE_GET_RESPONSE = [
-    {"name": "PLANE_HEADING_DEGREES_MAGNETIC", "val": 95.5, "unit": "Degrees", "writable": True},
+    {"name": "PLANE_HEADING_DEGREES_MAGNETIC", "val": math.radians(95.5), "unit": "Radians", "writable": True},
     {"name": "PLANE_ALTITUDE", "val": 5020.3, "unit": "Feet", "writable": True},
     {"name": "PLANE_LATITUDE", "val": 47.6, "unit": "Degrees", "writable": False},
 ]
@@ -85,6 +88,49 @@ def test_read_state_retries_on_http_error(monkeypatch):
         state = flight_io.read_state()
         assert mock_get.call_count == 2
         assert state["heading"] == pytest.approx(95.5)
+
+
+# ------------------------------------------------------------
+# heading 弧度/度 转换（bridge 端 PLANE_HEADING_DEGREES_MAGNETIC 实为弧度）
+# ------------------------------------------------------------
+
+
+def test_heading_rad_to_deg_basic():
+    assert flight_io._heading_rad_to_deg(0.0) == pytest.approx(0.0)
+    assert flight_io._heading_rad_to_deg(math.pi / 2) == pytest.approx(90.0)
+    assert flight_io._heading_rad_to_deg(math.pi) == pytest.approx(180.0)
+
+
+def test_heading_rad_to_deg_normalizes_into_0_360():
+    # 负角和 >2π 都要折回 [0, 360)
+    assert flight_io._heading_rad_to_deg(-math.pi / 2) == pytest.approx(270.0)
+    assert flight_io._heading_rad_to_deg(2 * math.pi + math.pi / 2) == pytest.approx(90.0)
+
+
+def test_heading_deg_to_rad_roundtrip():
+    for deg in (0.0, 90.0, 120.0, 359.0):
+        assert flight_io._heading_deg_to_rad(deg) == pytest.approx(math.radians(deg))
+        # 往返自洽
+        back = flight_io._heading_rad_to_deg(flight_io._heading_deg_to_rad(deg))
+        assert back == pytest.approx(deg)
+
+
+def test_read_state_converts_radians_to_degrees(monkeypatch):
+    # 复现 bug：bridge 返回 2.0354 弧度，应转成 ≈116.6° 而非被当成 2.03°
+    monkeypatch.setattr(flight_io, "API_URL_GET", "http://fake/get")
+    resp_data = [
+        {"name": "PLANE_HEADING_DEGREES_MAGNETIC", "val": 2.0354, "unit": "Radians", "writable": True},
+        {"name": "PLANE_ALTITUDE", "val": 5000.0, "unit": "Feet", "writable": True},
+    ]
+    with patch("pid_exp.flight_io.requests.get") as mock_get:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = resp_data
+        mock_get.return_value = resp
+
+        state = flight_io.read_state()
+        assert state["heading"] == pytest.approx(math.degrees(2.0354), abs=1e-6)
+        assert state["heading"] == pytest.approx(116.6, abs=0.1)
 
 
 def test_hover_calls_correct_params():
@@ -162,7 +208,10 @@ def test_reset_to_happy_path():
         flight_io.reset_to(heading=90.0, altitude=5000.0)
         # 应该 set heading, altitude, 然后 hover（hover 内部又 set 4 个参数）
         param_calls = [c.args for c in mock_set.call_args_list]
-        assert ("PLANE_HEADING_DEGREES_MAGNETIC", 90.0) in param_calls
+        # heading 写回时转成弧度（90° → π/2），altitude 不转
+        heading_writes = [c for c in param_calls if c[0] == "PLANE_HEADING_DEGREES_MAGNETIC"]
+        assert len(heading_writes) == 1
+        assert heading_writes[0][1] == pytest.approx(math.radians(90.0))
         assert ("PLANE_ALTITUDE", 5000.0) in param_calls
 
 
