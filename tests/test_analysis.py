@@ -5,32 +5,30 @@ import pandas as pd
 from pid_exp.analysis import compute_sensitivity
 
 
-def _ofat_summary_with_linear_trend(slope=2.0, intercept=10.0, nominal_kp=2.0):
-    """造一份 summary，让 metric 严格线性 = slope * pct + intercept。"""
+def _ofat_summary_with_linear_trend(slope=2.0, intercept=10.0, nominal_kp=2.0, std=0.5):
+    """造一份 summary（每 metric 带 _mean/_std/_n），rise_time 严格线性 = slope*pct + intercept。"""
+    metric_names = ["rise_time_10_90", "peak_time", "overshoot_pct",
+                    "settling_time_5pct", "steady_state_error", "iae"]
     rows = []
     deltas = [(-0.20, "P-20%"), (-0.10, "P-10%"), (0.00, "Nominal"),
               (+0.10, "P+10%"), (+0.20, "P+20%")]
     for δ, lbl in deltas:
-        kp = nominal_kp * (1 + δ)
-        metric_value = slope * δ + intercept
-        rows.append({
-            "run_label": lbl, "axis": "heading",
-            "kp": kp, "ki": 0.1, "kd": 0.5,
-            "rise_time_10_90": metric_value,
-            "peak_time": 0, "overshoot_pct": 0,
-            "settling_time_5pct": 0, "steady_state_error": 0, "iae": 0,
-        })
+        row = {"run_label": lbl, "axis": "heading",
+               "kp": nominal_kp * (1 + δ), "ki": 0.1, "kd": 0.5}
+        for m in metric_names:
+            row[f"{m}_mean"] = (slope * δ + intercept) if m == "rise_time_10_90" else 0.0
+            row[f"{m}_std"], row[f"{m}_n"] = std, 10
+        rows.append(row)
     # 加 I 和 D 变体（变化都是 0）
     for prefix in ["I", "D"]:
         for δ, suffix in [(-0.20, "20%"), (-0.10, "10%"), (+0.10, "10%"), (+0.20, "20%")]:
             sign = "+" if δ > 0 else "-"
-            rows.append({
-                "run_label": f"{prefix}{sign}{suffix}",
-                "axis": "heading", "kp": 2.0, "ki": 0.1, "kd": 0.5,
-                "rise_time_10_90": intercept,
-                "peak_time": 0, "overshoot_pct": 0,
-                "settling_time_5pct": 0, "steady_state_error": 0, "iae": 0,
-            })
+            row = {"run_label": f"{prefix}{sign}{suffix}", "axis": "heading",
+                   "kp": 2.0, "ki": 0.1, "kd": 0.5}
+            for m in metric_names:
+                row[f"{m}_mean"] = intercept if m == "rise_time_10_90" else 0.0
+                row[f"{m}_std"], row[f"{m}_n"] = std, 10
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -67,7 +65,7 @@ def test_compute_sensitivity_with_nan_skips():
     """有 NaN 时只用有效点拟合。"""
     df = _ofat_summary_with_linear_trend(slope=2.0, intercept=10.0)
     # P+20% 设为 NaN
-    df.loc[df["run_label"] == "P+20%", "rise_time_10_90"] = float("nan")
+    df.loc[df["run_label"] == "P+20%", "rise_time_10_90_mean"] = float("nan")
     result = compute_sensitivity(df, metric="rise_time_10_90", param="kp")
     # 4 点仍是线性 → slope ≈ 2, R² 仍很高
     assert result["slope"] == pytest.approx(2.0, abs=0.01)
@@ -76,8 +74,8 @@ def test_compute_sensitivity_with_nan_skips():
 
 def test_compute_sensitivity_all_nan_returns_nan():
     df = _ofat_summary_with_linear_trend(slope=2.0, intercept=10.0)
-    df.loc[df["run_label"].str.startswith("P"), "rise_time_10_90"] = float("nan")
-    df.loc[df["run_label"] == "Nominal", "rise_time_10_90"] = float("nan")
+    df.loc[df["run_label"].str.startswith("P"), "rise_time_10_90_mean"] = float("nan")
+    df.loc[df["run_label"] == "Nominal", "rise_time_10_90_mean"] = float("nan")
     result = compute_sensitivity(df, metric="rise_time_10_90", param="kp")
     assert math.isnan(result["slope"])
     assert math.isnan(result["r2"])
@@ -110,7 +108,7 @@ def test_sensitivity_table_writes_markdown(tmp_path):
 
 def test_sensitivity_table_handles_all_nan(tmp_path):
     df = _ofat_summary_with_linear_trend()
-    df["rise_time_10_90"] = float("nan")
+    df["rise_time_10_90_mean"] = float("nan")
     out_path = tmp_path / "sensitivity_table.md"
     # 不应抛错
     write_sensitivity_table(df, out_path, axis="heading",
@@ -123,10 +121,10 @@ def test_sensitivity_table_handles_all_nan(tmp_path):
 from pid_exp.analysis import plot_step_response_overlay, plot_sensitivity_grid
 
 
-def _make_minimal_run_dir(parent: Path, label: str, kp=2.0, ki=0.1, kd=0.5):
+def _make_minimal_run_dir(parent: Path, label: str, kp=2.0, ki=0.1, kd=0.5, rep="r01"):
     import json as _json, csv as _csv
     safe_lbl = label.replace("%", "pct").replace("+", "p").replace("-", "n")
-    rd = parent / f"01_{safe_lbl}"
+    rd = parent / f"01_{safe_lbl}" / rep
     rd.mkdir(parents=True, exist_ok=True)
     (rd / "config.json").write_text(_json.dumps({
         "axis": "heading", "kp": kp, "ki": ki, "kd": kd,

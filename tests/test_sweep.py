@@ -3,7 +3,7 @@ import pytest
 from pid_exp.sweep import SweepConfig, build_ofat_list
 
 
-def _basic_cfg(tmp_path, axis="heading"):
+def _basic_cfg(tmp_path, axis="heading", repeats=1):
     return SweepConfig(
         axis=axis,
         nominal_kp=2.0 if axis == "heading" else 1.5,
@@ -14,6 +14,7 @@ def _basic_cfg(tmp_path, axis="heading"):
         other_axis_value=5000 if axis == "heading" else 90,
         duration_s=45.0,
         output_root=tmp_path,
+        repeats=repeats,
     )
 
 
@@ -102,6 +103,26 @@ def test_ofat_output_dirs_unique(tmp_path):
     assert len(set(dirs)) == 13  # 全部不同
 
 
+def test_ofat_list_length_with_repeats(tmp_path):
+    cfg = _basic_cfg(tmp_path, repeats=10)
+    assert len(build_ofat_list(cfg)) == 130
+
+
+def test_ofat_grouped_order(tmp_path):
+    cfg = _basic_cfg(tmp_path, repeats=10)
+    exp_cfgs = build_ofat_list(cfg)
+    assert all(e.run_label == "Nominal" for e in exp_cfgs[:10])  # reps contiguous
+    assert exp_cfgs[10].run_label == "P-20%"
+
+
+def test_ofat_rep_dirs_nested_and_unique(tmp_path):
+    cfg = _basic_cfg(tmp_path, repeats=10)
+    dirs = [e.output_dir for e in build_ofat_list(cfg)]
+    assert len(set(dirs)) == 130
+    nominal = sorted(d for d in dirs if d.parent.name == "01_Nominal")
+    assert [d.name for d in nominal] == [f"r{i:02d}" for i in range(1, 11)]
+
+
 from unittest.mock import patch, MagicMock
 from pid_exp.sweep import run_sweep
 
@@ -121,6 +142,18 @@ def test_run_sweep_calls_experiment_for_each_run(tmp_path):
         mock_agg.assert_called_once()
         mock_analysis.assert_called_once()
         assert sweep_dir.exists()
+
+
+def test_run_sweep_repeats_call_count(tmp_path):
+    cfg = _basic_cfg(tmp_path, repeats=2)
+    with patch("pid_exp.sweep.experiment.run") as mock_run, \
+         patch("pid_exp.sweep.metrics.compute"), \
+         patch("pid_exp.sweep.metrics.aggregate") as mock_agg, \
+         patch("pid_exp.sweep.analysis.build_outputs", create=True), \
+         patch("pid_exp.sweep.flight_io.hover"):
+        mock_agg.return_value = tmp_path / "summary.csv"
+        run_sweep(cfg)
+        assert mock_run.call_count == 26
 
 
 def test_run_sweep_tolerates_few_failures(tmp_path):

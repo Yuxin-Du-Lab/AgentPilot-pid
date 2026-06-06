@@ -221,16 +221,38 @@ def test_aggregate_collects_all_runs(tmp_path):
     sweep_dir = tmp_path / "sweep_xyz"
     runs_dir = sweep_dir / "runs"
     for i, label in enumerate(["Nominal", "P+10%", "P-10%"]):
-        run_dir = runs_dir / f"{i+1:02d}_{label}"
-        _write_fake_run(run_dir, kp=2.0 * (1 + 0.1 * i), run_label=label)
-        compute(run_dir)
+        rep_dir = runs_dir / f"{i+1:02d}_{label}" / "r01"
+        _write_fake_run(rep_dir, kp=2.0 * (1 + 0.1 * i), run_label=label)
+        compute(rep_dir)
 
     summary_path = aggregate(sweep_dir)
     assert summary_path.exists()
     import pandas as pd
     df = pd.read_csv(summary_path)
-    assert len(df) == 3
+    assert len(df) == 3                       # one row per config
     assert "run_label" in df.columns
     assert "kp" in df.columns
-    assert "rise_time_10_90" in df.columns
+    assert "rise_time_10_90_mean" in df.columns
+    assert "rise_time_10_90_std" in df.columns
+    assert "rise_time_10_90_n" in df.columns
     assert set(df["run_label"]) == {"Nominal", "P+10%", "P-10%"}
+
+
+def test_aggregate_computes_mean_std_n(tmp_path):
+    sweep_dir = tmp_path / "sweep_reps"
+    config_dir = sweep_dir / "runs" / "01_Nominal"
+    for rep in range(1, 4):                    # 3 identical reps
+        rep_dir = config_dir / f"r{rep:02d}"
+        _write_fake_run(rep_dir, run_label="Nominal")
+        compute(rep_dir)
+
+    aggregate(sweep_dir)
+    import pandas as pd
+    df = pd.read_csv(sweep_dir / "summary.csv")
+    assert len(df) == 1
+    assert df.iloc[0]["rise_time_10_90_n"] == 3
+    # 3 个相同 rep → std = 0
+    assert df.iloc[0]["rise_time_10_90_std"] == pytest.approx(0.0, abs=1e-9)
+    runs_df = pd.read_csv(sweep_dir / "summary_runs.csv")
+    assert len(runs_df) == 3
+    assert set(runs_df["rep"]) == {"r01", "r02", "r03"}

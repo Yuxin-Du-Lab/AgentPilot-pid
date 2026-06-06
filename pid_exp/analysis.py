@@ -24,30 +24,33 @@ _LABEL_DELTA = {
 }
 
 
-def _extract_param_curve(df: pd.DataFrame, metric: str, param: str) -> tuple[np.ndarray, np.ndarray]:
-    """从 summary 抽出某参数的 5 个 OFAT 点 (pct, metric_value)。Nominal 是公共原点 0%。"""
+def _extract_param_curve(df: pd.DataFrame, metric: str, param: str):
+    """抽某参数的 5 个 OFAT 点 (pct, mean, std)。Nominal 是公共原点 0%。"""
+    mean_col, std_col = f"{metric}_mean", f"{metric}_std"
     pcts: list[float] = []
-    values: list[float] = []
+    means: list[float] = []
+    stds: list[float] = []
     for _, row in df.iterrows():
         if row["run_label"] not in _LABEL_DELTA:
             continue
         which_param, δ = _LABEL_DELTA[row["run_label"]]
         if which_param == "nominal" or which_param == param:
             pcts.append(δ)
-            values.append(row[metric])
+            means.append(row[mean_col])
+            stds.append(row[std_col] if std_col in df.columns else math.nan)
     arr_pct = np.array(pcts, dtype=float)
-    arr_val = np.array(values, dtype=float)
-    # 按 pct 排序，去掉 NaN
+    arr_mean = np.array(means, dtype=float)
+    arr_std = np.array(stds, dtype=float)
+    # 按 pct 排序，去掉 mean 为 NaN 的点
     order = np.argsort(arr_pct)
-    arr_pct = arr_pct[order]
-    arr_val = arr_val[order]
-    valid = ~np.isnan(arr_val)
-    return arr_pct[valid], arr_val[valid]
+    arr_pct, arr_mean, arr_std = arr_pct[order], arr_mean[order], arr_std[order]
+    valid = ~np.isnan(arr_mean)
+    return arr_pct[valid], arr_mean[valid], arr_std[valid]
 
 
 def compute_sensitivity(df: pd.DataFrame, metric: str, param: str) -> dict:
     """返回 {slope, range, r2}。slope 单位是 metric per 100% 参数变化。"""
-    pcts, values = _extract_param_curve(df, metric, param)
+    pcts, values, _ = _extract_param_curve(df, metric, param)
 
     nan_result = {"slope": math.nan, "range": math.nan, "r2": math.nan}
     if len(pcts) < 2:
@@ -100,7 +103,15 @@ def _get_nominal_value(df: pd.DataFrame, metric: str) -> float:
     nominal_rows = df[df["run_label"] == "Nominal"]
     if len(nominal_rows) == 0:
         return math.nan
-    val = nominal_rows.iloc[0][metric]
+    val = nominal_rows.iloc[0][f"{metric}_mean"]
+    return float(val) if not pd.isna(val) else math.nan
+
+
+def _get_nominal_std(df: pd.DataFrame, metric: str) -> float:
+    nominal_rows = df[df["run_label"] == "Nominal"]
+    if len(nominal_rows) == 0 or f"{metric}_std" not in df.columns:
+        return math.nan
+    val = nominal_rows.iloc[0][f"{metric}_std"]
     return float(val) if not pd.isna(val) else math.nan
 
 
@@ -126,7 +137,11 @@ def write_sensitivity_table(df: pd.DataFrame, out_path: Path, axis: str,
     for m in _METRICS_TO_REPORT:
         unit = _METRIC_UNITS[m].replace("err_unit", err_unit)
         nominal_val = _get_nominal_value(df, m)
-        cells = [f"{m} ({unit})", _fmt_num(nominal_val)]
+        nominal_std = _get_nominal_std(df, m)
+        nominal_cell = _fmt_num(nominal_val)
+        if not math.isnan(nominal_std):
+            nominal_cell += f" (±{_fmt_num(nominal_std)})"
+        cells = [f"{m} ({unit})", nominal_cell]
         for param in ("kp", "ki", "kd"):
             s = compute_sensitivity(df, m, param)
             cells.append(
@@ -157,18 +172,31 @@ def _safe_label(label: str) -> str:
     return label.replace("%", "pct").replace("+", "p").replace("-", "n")
 
 
-def _load_run_log(sweep_dir: Path, label: str) -> pd.DataFrame | None:
-    """根据 run_label 在 sweep_dir/runs/ 下找对应 log.csv，找不到返回 None。"""
+def _load_run_mean_curve(sweep_dir: Path, label: str):
+    """某 OFAT 档位所有 rep 的 current(t) 重采样到公共网格 → (t, mean, std, target) 或 None。"""
     runs_dir = sweep_dir / "runs"
-    target = _safe_label(label)
-    for child in runs_dir.iterdir():
-        if not child.is_dir():
+    safe = _safe_label(label)
+    config_dir = next((c for c in runs_dir.iterdir()
+                       if c.is_dir() and c.name.endswith(f"_{safe}")), None)
+    if config_dir is None:
+        return None
+    curves, target_val = [], None
+    for rep_dir in sorted(config_dir.iterdir()):
+        log_path = rep_dir / "log.csv"
+        if not rep_dir.is_dir() or not log_path.exists():
             continue
-        if child.name.endswith(f"_{target}"):
-            log_path = child / "log.csv"
-            if log_path.exists():
-                return pd.read_csv(log_path)
-    return None
+        df = pd.read_csv(log_path)
+        if len(df) < 2:
+            continue
+        curves.append((df["t"].values, df["current"].values))
+        if target_val is None and "target" in df.columns:
+            target_val = float(df["target"].iloc[0])
+    if not curves:
+        return None
+    t_max = min(t.max() for t, _ in curves)
+    t_grid = np.linspace(0.0, t_max, 100)
+    stacked = np.vstack([np.interp(t_grid, t, cur) for t, cur in curves])
+    return t_grid, stacked.mean(axis=0), stacked.std(axis=0), target_val
 
 
 def plot_step_response_overlay(sweep_dir: Path, out_path: Path, axis: str) -> None:
@@ -181,13 +209,16 @@ def plot_step_response_overlay(sweep_dir: Path, out_path: Path, axis: str) -> No
 
     for ax, title, variants in zip(axes, titles, variant_sets):
         for label, color in zip(variants, colors):
-            df = _load_run_log(sweep_dir, label)
-            if df is None or len(df) == 0:
+            loaded = _load_run_mean_curve(sweep_dir, label)
+            if loaded is None:
                 continue
-            ax.plot(df["t"], df["current"], label=label, color=color,
-                    linewidth=1.5 if label == "Nominal" else 1.0)
-            # 画 target line
-            ax.axhline(df["target"].iloc[0], linestyle="--", color="gray", alpha=0.3)
+            t_grid, mean_curve, std_curve, target_val = loaded
+            ax.plot(t_grid, mean_curve, label=label, color=color,
+                    linewidth=1.8 if label == "Nominal" else 1.1)
+            ax.fill_between(t_grid, mean_curve - std_curve, mean_curve + std_curve,
+                            color=color, alpha=0.12)
+            if target_val is not None:
+                ax.axhline(target_val, linestyle="--", color="gray", alpha=0.3)
         ax.set_title(title)
         ax.set_xlabel("t (s)")
         ax.legend(loc="best", fontsize=8)
@@ -210,9 +241,11 @@ def plot_sensitivity_grid(df: pd.DataFrame, out_path: Path, axis: str) -> None:
     for row_i, metric in enumerate(_METRICS_TO_REPORT):
         for col_i, param in enumerate(params):
             ax = axes[row_i, col_i]
-            pcts, values = _extract_param_curve(df, metric, param)
+            pcts, values, stds = _extract_param_curve(df, metric, param)
             if len(pcts) >= 2:
-                ax.scatter(pcts * 100, values, color="black", zorder=3)
+                yerr = np.where(np.isnan(stds), 0.0, stds)
+                ax.errorbar(pcts * 100, values, yerr=yerr, fmt="o",
+                            color="black", ecolor="gray", capsize=3, zorder=3)
                 # 拟合
                 slope, intercept = np.polyfit(pcts, values, deg=1)
                 x_fit = np.linspace(-0.25, 0.25, 50)

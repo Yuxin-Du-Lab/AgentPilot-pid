@@ -25,6 +25,7 @@ class SweepConfig:
     duration_s: float
     output_root: Path
     sweep_label: str | None = None  # 默认按时间戳生成
+    repeats: int = 10               # 每个配置重复次数
 
 
 _DELTAS = [
@@ -58,16 +59,18 @@ def build_ofat_list(cfg: SweepConfig) -> list[ExperimentConfig]:
     for idx, (kp, ki, kd, label) in enumerate(triplets, start=1):
         # 文件名用安全字符（替换 % 和 +）
         safe_lbl = label.replace("%", "pct").replace("+", "p").replace("-", "n")
-        run_dir = sweep_dir / "runs" / f"{idx:02d}_{safe_lbl}"
-        out.append(ExperimentConfig(
-            axis=cfg.axis,
-            kp=kp, ki=ki, kd=kd,
-            initial=cfg.initial, target=cfg.target,
-            other_axis_value=cfg.other_axis_value,
-            duration_s=cfg.duration_s,
-            output_dir=run_dir,
-            run_label=label,
-        ))
+        config_dir = sweep_dir / "runs" / f"{idx:02d}_{safe_lbl}"
+        # 分组顺序：同一配置的 repeats 次连续排在一起
+        for rep in range(1, cfg.repeats + 1):
+            out.append(ExperimentConfig(
+                axis=cfg.axis,
+                kp=kp, ki=ki, kd=kd,
+                initial=cfg.initial, target=cfg.target,
+                other_axis_value=cfg.other_axis_value,
+                duration_s=cfg.duration_s,
+                output_dir=config_dir / f"r{rep:02d}",
+                run_label=label,
+            ))
     return out
 
 
@@ -102,7 +105,11 @@ def run_sweep(cfg: SweepConfig) -> Path:
     _save_sweep_config(cfg, sweep_dir)
 
     exp_cfgs = build_ofat_list(cfg)
-    logger.info("Starting sweep %s: %d runs", cfg.sweep_label, len(exp_cfgs))
+    # 失败阈值随总 run 数放大，130-run sweep 容忍零散瞬时失败
+    max_failures = max(_MAX_FAILURES, len(exp_cfgs) // 10)
+    n_configs = len(exp_cfgs) // cfg.repeats if cfg.repeats else len(exp_cfgs)
+    logger.info("Starting sweep %s: %d runs (%d configs × %d reps)",
+                cfg.sweep_label, len(exp_cfgs), n_configs, cfg.repeats)
 
     failed = []
     for exp_cfg in exp_cfgs:
@@ -111,11 +118,12 @@ def run_sweep(cfg: SweepConfig) -> Path:
             metrics.compute(exp_cfg.output_dir)
         except Exception as e:
             logger.exception("Run %s failed: %s", exp_cfg.run_label, e)
-            failed.append({"run_label": exp_cfg.run_label, "error": str(e)})
-            if len(failed) > _MAX_FAILURES:
+            failed.append({"run_label": exp_cfg.run_label,
+                           "output_dir": str(exp_cfg.output_dir), "error": str(e)})
+            if len(failed) > max_failures:
                 _write_failed(sweep_dir, failed)
                 raise RuntimeError(
-                    f"失败次数超过 {_MAX_FAILURES}，中止 sweep"
+                    f"失败次数超过 {max_failures}，中止 sweep"
                 ) from e
         # run 之间显式 hover，确保下一次 reset 的初始扰动小
         try:
@@ -151,6 +159,8 @@ def _make_cli() -> argparse.ArgumentParser:
     parser.add_argument("--other-axis", type=float, default=None,
                         help="另一轴固定复位值（默认 heading 实验 alt=5000；alt 实验 heading=90）")
     parser.add_argument("--duration", type=float, default=45.0)
+    parser.add_argument("--repeats", type=int, default=10,
+                        help="每个配置重复次数（默认 10）")
     parser.add_argument("--output-root", type=Path,
                         default=Path("results"))
     parser.add_argument("--sweep-label", type=str, default=None,
@@ -180,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
         duration_s=args.duration,
         output_root=args.output_root,
         sweep_label=args.sweep_label,
+        repeats=args.repeats,
     )
     sweep_dir = run_sweep(cfg)
     print(f"\nSweep finished. Results in: {sweep_dir}")

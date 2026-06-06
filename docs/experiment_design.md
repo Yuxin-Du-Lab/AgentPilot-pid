@@ -18,6 +18,8 @@
 10-13 Kd 扫描: ±10%, ±20% (Kp=Kp⁰, Ki=Ki⁰ 固定)
 ```
 
+**重复实验（replication）：** 每个配置重复 **10 次**，即单轴 **130 run**（13 配置 × 10 rep）。本系统有真实随机性（HTTP 节拍抖动、bang-bang chattering、复位 ±5° 容差让真实阶跃量在 25°–35° 浮动），单次结果会误导。10 rep 让我们能报告每档**均值 ± 标准差**，敏感性斜率拟合在每档均值上做。执行顺序**分组**：同一配置的 10 个 rep 连续跑完再换下一配置。
+
 **为什么选 OFAT 而不是全因子网格（如 3×3×3 / 5×5×5）：**
 
 | 维度 | OFAT (13 run) | 全因子 3×3×3 (27) | 全因子 5×5×5 (125) |
@@ -144,10 +146,11 @@ action_time = clip(abs(control_raw) * 0.5,  min=0.1,  max=1.0)   # 单位：秒
 | 单 run 复位 | ~5 s |
 | 单 run 余量 | ~2 s |
 | **单 run 合计** | **~52 s** |
-| 单轴 13 run | **~11 min** |
-| 双轴 26 run | **~22 min** |
+| 单配置 10 rep | **~9 min** |
+| 单轴 130 run（13 配置 × 10 rep） | **~1.9 h** |
+| 双轴 260 run | **~3.8 h** |
 
-实际跑完总计约 **22 分钟**（连续无失败），适合一次坐下来跑完。
+实际单轴跑完约 **1.9 小时**（连续无失败），双轴约 **3.8 小时**。比单次（n=1）的 ~11 min/轴 大很多，但换来每档均值±标准差，结果更可信。建议一轴一坐跑完。
 
 ## 8. 标量 Metric 定义
 
@@ -196,11 +199,13 @@ step_size = abs(target - initial)。误差单位：heading 度，altitude 英尺
 
 ### 9.1 `sensitivity_table.md`（**核心交付物**）
 
-数字呈现，每个 (metric, 参数) 给出 **slope / range / R²** 三个数：
+数字呈现，每个 (metric, 参数) 给出 **slope / range / R²** 三个数。这里的 5 个 OFAT 点用的是**每档 10 rep 的均值**（不是单 run 值）：
 
-- **slope**：用 5 个 OFAT 点 (-20, -10, 0, +10, +20%) 一阶 polyfit 得到的斜率，单位 = `<metric 单位> / 100% 参数变化`。展示 metric 对该参数的"灵敏度强度 + 方向"
-- **range**：5 个点中 metric 的 max - min，反映**实际经历的变化幅度**（即使非线性也有意义）
-- **R²**：5 点拟合的决定系数。R² > 0.95 → 单调线性；R² 接近 0 → 非线性（如 U 型）
+- **slope**：用 5 个均值点 (-20, -10, 0, +10, +20%) 一阶 polyfit 得到的斜率，单位 = `<metric 单位> / 100% 参数变化`。展示 metric 对该参数的"灵敏度强度 + 方向"
+- **range**：5 个均值点中 metric 的 max - min，反映**实际经历的变化幅度**（即使非线性也有意义）
+- **R²**：5 个均值点拟合的决定系数。R² > 0.95 → 单调线性；R² 接近 0 → 非线性（如 U 型）
+
+Nominal 列显示 `mean (±std)`，让读者一眼看到该档 10 rep 的散布。
 
 文件示例（具体数字以实跑结果填充）：
 
@@ -228,16 +233,29 @@ Sweep dir: results/2026-06-04_15-30_heading_OFAT
 - range 是 5 点 max-min 的实际跨度，比 slope 更直接看"在 ±20% 范围内 metric 跳了多少"
 ```
 
-### 9.2 `summary.csv`
+### 9.2 `summary.csv` + `summary_runs.csv`
 
-26 行（13 heading + 13 altitude），所有 metric 横向铺开。schema：
+`summary.csv`：**每配置一行**（单轴 sweep = 13 行），每个 metric 横向铺开为 mean/std/n 三列。schema：
 
 ```
-sweep_id, run_id, run_label, axis,
-kp, ki, kd,
+run_id, run_label, axis, kp, ki, kd,
+rise_time_10_90_mean, rise_time_10_90_std, rise_time_10_90_n,
+peak_time_mean, peak_time_std, peak_time_n,
+overshoot_pct_mean, overshoot_pct_std, overshoot_pct_n,
+settling_time_5pct_mean, settling_time_5pct_std, settling_time_5pct_n,
+steady_state_error_mean, steady_state_error_std, steady_state_error_n,
+iae_mean, iae_std, iae_n
+```
+
+`summary_runs.csv`：**每 rep 一行**（单轴 = 130 行），保留每次重复的原始 metric 值，便于溯源和复算。schema：
+
+```
+run_id, rep, run_label, axis, kp, ki, kd,
 rise_time_10_90, peak_time, overshoot_pct, settling_time_5pct,
 steady_state_error, iae
 ```
+
+std 约定：过滤掉 NaN 的 rep，`n` = 有效 rep 数；`n≥2` 用样本标准差（ddof=1），`n==1` 记 0，`n==0` 则 mean/std 均为 NaN。
 
 ### 9.3 `step_response_overlay.png`
 
@@ -256,15 +274,15 @@ steady_state_error, iae
    └─────────────────────────────┘ └─────────────────────┘ └─────────────────────┘
 ```
 
-heading 轴 1 张，altitude 轴 1 张，共 2 张图。**这是最直观看"参数变了曲线变成什么样"的可视化。**
+heading 轴 1 张，altitude 轴 1 张，共 2 张图。**这是最直观看"参数变了曲线变成什么样"的可视化。** 每条曲线是该档 10 rep 的 `current(t)` 重采样到公共时间网格后的**均值线**，外加一条 ±std 的阴影带，直接显示 rep 间散布。
 
 ### 9.4 `sensitivity_plots.png`
 
 每个 (metric × 参数) 一个小子图，展示 5 点拟合：
 
 - 横轴：参数变化百分比（-20, -10, 0, +10, +20）
-- 纵轴：metric 值
-- 5 个散点 + 拟合直线 + R² 标注
+- 纵轴：metric 均值
+- 5 个均值点（带 ±std 误差棒）+ 拟合直线 + R² 标注
 
 6 个 metric × 3 参数 = 18 子图，按 metric 行 × 参数列排成 6×3 网格。每轴 1 张，共 2 张图。
 
@@ -276,8 +294,8 @@ heading 轴 1 张，altitude 轴 1 张，共 2 张图。**这是最直观看"参
 
 实验设计成功的标准：
 
-1. ✅ 26 个 run 全部跑完（或失败 ≤3 个）
-2. ✅ 每个 run 有完整的 `log.csv` + `metrics.json` + `config.json`
+1. ✅ 单轴 130 个 run 全部跑完（或失败 ≤ `max(3, 总run数//10)`，即 130-run sweep 容忍 ≤13 个）
+2. ✅ 每个 rep 有完整的 `log.csv` + `metrics.json` + `config.json`；`summary.csv` 13 行带 `_mean/_std/_n`，`summary_runs.csv` 130 行
 3. ✅ Nominal run 的响应曲线"看起来正常"（先 rise，可能有 overshoot，最后趋稳）
 4. ✅ `sensitivity_table.md` 数字合理：
    - 至少 Kp 列在 rise_time / overshoot 上 R² > 0.7（PID 教科书结论：Kp 应该单调影响这两个）

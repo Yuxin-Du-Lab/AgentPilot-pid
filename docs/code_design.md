@@ -287,10 +287,15 @@ def compute(run_dir: Path) -> dict:
     """读 log.csv + config.json, 返回 metrics dict, 同时写 metrics.json"""
 
 def aggregate(sweep_dir: Path) -> Path:
-    """把 sweep_dir 下所有 runs/<id>/metrics.json 聚合, 写 sweep_dir/summary.csv"""
+    """两级聚合 runs/<config>/r<NN>/。写 summary.csv（每配置 mean/std/n）
+    + summary_runs.csv（每 rep 原始值）。返回 summary.csv 路径。"""
 ```
 
-`summary.csv` 字段：`run_id, run_label, axis, kp, ki, kd, [所有 metric 字段]`。
+每个配置重复 N 次（见 4.5.1 `repeats`），`aggregate` 做**两级聚合**：外层遍历 `runs/<config>/`，内层读其下所有 `r<NN>/metrics.json`，对每个 metric 跨 rep 求 mean/std/n。
+
+- `summary.csv`：**每配置一行**（13 行）。字段 `run_id, run_label, axis, kp, ki, kd` + 每个 metric 三列 `{metric}_mean, {metric}_std, {metric}_n`。
+- `summary_runs.csv`：**每 rep 一行**（N×13 行，全量原始值，便于溯源）。字段 `run_id, rep, run_label, axis, kp, ki, kd, [6 个原始 metric 列]`。
+- std 约定：过滤掉 None/NaN 的 rep；`n` = 有效 rep 数；`n≥2` 用样本标准差（ddof=1），`n==1` 记 0.0，`n==0` 记 NaN。
 
 ### 4.5 `sweep.py`
 
@@ -309,6 +314,7 @@ class SweepConfig:
     duration_s: float = 45.0
     output_root: Path
     sweep_label: str | None = None       # 自动用时间戳生成
+    repeats: int = 10                    # 每个配置重复次数
 ```
 
 #### 4.5.2 OFAT 列表生成
@@ -326,6 +332,8 @@ def build_ofat_list(cfg: SweepConfig) -> list[ExperimentConfig]:
     return [_make_exp_cfg(cfg, kp, ki, kd, label, idx) for idx, (kp,ki,kd,label) in enumerate(runs, 1)]
 ```
 
+每个配置展开为 `cfg.repeats` 个 `ExperimentConfig`，**分组排列**（同一配置的 N 个 rep 连续排在一起），输出目录嵌套到 rep 一层：`runs/{idx:02d}_{safe_lbl}/r{rep:02d}/`。所以一轴共 `13 × repeats` 个 run（默认 130）。`experiment.run` 写文件前已 `mkdir(parents=True)`，rep 叶子目录自动创建，无需额外处理。
+
 #### 4.5.3 主循环
 
 ```python
@@ -334,6 +342,8 @@ def run_sweep(cfg: SweepConfig) -> Path:
     _save_sweep_config(cfg, sweep_dir)
 
     exp_cfgs = build_ofat_list(cfg)
+    # 失败阈值随总 run 数放大：max(3, len(exp_cfgs)//10)，130-run sweep 容忍零散瞬时失败
+    max_failures = max(3, len(exp_cfgs) // 10)
     failed = []
     for exp_cfg in exp_cfgs:
         try:
@@ -341,9 +351,10 @@ def run_sweep(cfg: SweepConfig) -> Path:
             metrics.compute(exp_cfg.output_dir)
         except Exception as e:
             logger.error(f"run {exp_cfg.run_label} 失败: {e}")
-            failed.append((exp_cfg.run_label, str(e)))
-            if len(failed) > 3:
-                raise RuntimeError("失败次数超过 3，中止 sweep")
+            failed.append({"run_label": exp_cfg.run_label,
+                           "output_dir": str(exp_cfg.output_dir), "error": str(e)})
+            if len(failed) > max_failures:
+                raise RuntimeError(f"失败次数超过 {max_failures}，中止 sweep")
         flight_io.hover()                       # 防止前一个 run 末态污染
 
     metrics.aggregate(sweep_dir)
@@ -354,10 +365,13 @@ def run_sweep(cfg: SweepConfig) -> Path:
 #### 4.5.4 命令行
 
 ```bash
-python -m pid_exp.sweep --axis heading                        # 用默认 nominal
+python -m pid_exp.sweep --axis heading                        # 用默认 nominal，repeats=10
 python -m pid_exp.sweep --axis altitude
 python -m pid_exp.sweep --axis heading --kp 2.0 --ki 0.1 --kd 0.5  # 显式指定
+python -m pid_exp.sweep --axis heading --repeats 2 --duration 5    # 快速冒烟（少 rep 短时长）
 ```
+
+`--repeats N`（默认 10）控制每个配置重复次数。
 
 ### 4.6 `analysis.py`
 
@@ -383,13 +397,19 @@ def build_outputs(sweep_dir: Path) -> None:
 
 对每个 (metric, 参数 ∈ {Kp, Ki, Kd}) 组合：
 
-- 提取 5 个点：`pct ∈ {-0.20, -0.10, 0.00, +0.10, +0.20}` → 5 个 metric 值
-- 用 `numpy.polyfit(pct, metric_values, deg=1)` 拟合一阶直线：`metric = slope × pct + intercept`
+- 提取 5 个点：`pct ∈ {-0.20, -0.10, 0.00, +0.10, +0.20}` → 5 个**每档均值** `{metric}_mean`（同时取出 `{metric}_std` 供画误差棒）
+- 用 `numpy.polyfit(pct, mean_values, deg=1)` 拟合一阶直线：`metric = slope × pct + intercept`（拟合用的是均值，不是单 run 原始值）
 - **`slope` 的单位是"metric 单位 per 100% 参数变化"**，因为 pct 用 fraction 形式（0.10 = 10%），slope 系数对应 pct=1.0 时（即 +100%）的 metric 增量
-- `r2`：用 `1 - SS_res / SS_tot` 算决定系数（5 个点对线性拟合的吻合度，单调线性 R² → 1，U/Λ 形 R² 偏小）
-- `range = max(metric_values) - min(metric_values)`：5 点实际跨度
-- 若该 metric 在 5 个点中全为 NaN（如永不收敛 run 的 settling_time），slope/r2/range 全部输出 NaN
+- `r2`：用 `1 - SS_res / SS_tot` 算决定系数（5 个均值点对线性拟合的吻合度，单调线性 R² → 1，U/Λ 形 R² 偏小）
+- `range = max(mean_values) - min(mean_values)`：5 个均值点实际跨度
+- 若该 metric 在 5 个点中均值全为 NaN（如永不收敛 run 的 settling_time），slope/r2/range 全部输出 NaN
 - 详见 `experiment_design.md` 第 9.1 节的输出表定义
+
+可视化对 rep 间散布的呈现：
+
+- `sensitivity_plots.png`：散点改用 `ax.errorbar(...)`，纵向误差棒 = 该档 `{metric}_std`
+- `step_response_overlay.png`：每档把所有 rep 的 `current(t)` 重采样到公共时间网格，画**均值曲线 + ±std 阴影带**（不再是单条原始曲线）
+- `sensitivity_table.md`：Nominal 列显示 `mean (±std)`
 
 ## 5. 配置（`.env`）
 
@@ -419,13 +439,17 @@ D:/work/pilot/aircraft_agent/pid_exp/
 │   └── 2026-06-04_15-30_heading_OFAT/
 │       ├── sweep_config.json
 │       ├── runs/
-│       │   ├── 01_Nominal/
-│       │   │   ├── config.json
-│       │   │   ├── log.csv
-│       │   │   └── metrics.json
-│       │   ├── 02_P-20%/
+│       │   ├── 01_Nominal/           # 每配置一个目录，下含 repeats 个 rep
+│       │   │   ├── r01/
+│       │   │   │   ├── config.json
+│       │   │   │   ├── log.csv
+│       │   │   │   └── metrics.json
+│       │   │   ├── r02/
+│       │   │   └── ...               # 默认 r01..r10
+│       │   ├── 02_Pn20pct/
 │       │   └── ...
-│       ├── summary.csv
+│       ├── summary.csv               # 每配置一行（mean/std/n）
+│       ├── summary_runs.csv          # 每 rep 一行（原始值）
 │       ├── sensitivity_table.md
 │       ├── step_response_overlay.png
 │       └── sensitivity_plots.png
@@ -457,7 +481,7 @@ matplotlib>=3.8
 |---|---|---|
 | HTTP 单次调用超时/失败 | `flight_io` | 内部 retry 2 次，仍失败抛 `FlightIOError` |
 | 复位后状态超出容差 | `flight_io.reset_to` | 抛 `ResetVerificationError` |
-| 单个 run 任意异常 | `sweep.run_sweep` | catch + 记录，跳过；累计 >3 次失败则中止 sweep |
+| 单个 run 任意异常 | `sweep.run_sweep` | catch + 记录到 `failed.json`，跳过；累计 > `max(3, 总run数//10)` 次失败则中止 sweep |
 | metric 无法计算（如永不收敛） | `metrics.compute` | 该 metric 写为 NaN，`converged=False` |
 | 用户 Ctrl+C | `sweep.run_sweep` | 已完成的 run 保留；不做断点续跑（YAGNI） |
 
@@ -480,5 +504,5 @@ matplotlib>=3.8
 |---|---|
 | 模块单测 | `pid_controller` 的 wrap-around、积分、微分各写 1 个 unit test（pytest） |
 | 集成冒烟 | 跑一个 1 分钟的 Nominal run，看 `log.csv` 是否有数据，`metrics.json` 是否计算成功 |
-| 全 sweep 验证 | 跑一次完整的 heading 13-run sweep，检查所有产出文件齐备且能打开 |
+| 全 sweep 验证 | 先 `--repeats 2 --duration 5` 冒烟（runs/01_Nominal/r01,r02 齐备、summary.csv 13 行带 _mean/_std/_n、summary_runs.csv 26 行），再跑完整 heading sweep（默认 130 run），检查所有产出文件齐备且能打开 |
 | 数值合理性 | Nominal run 的 overshoot、settling_time 应该和原 agent 现场观察一致（用户主观判断） |

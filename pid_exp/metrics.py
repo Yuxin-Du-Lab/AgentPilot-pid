@@ -169,32 +169,66 @@ def compute(run_dir: Path) -> dict:
     return metrics_dict
 
 
+def _rep_metric_values(config_dir: Path):
+    """读 config_dir 下所有 r*/ 的 config.json + metrics.json。返回 (meta, [rep dict])。"""
+    reps, meta = [], None
+    for rep_dir in sorted(config_dir.iterdir()):
+        if not rep_dir.is_dir():
+            continue
+        cfg_path, metrics_path = rep_dir / "config.json", rep_dir / "metrics.json"
+        if not cfg_path.exists() or not metrics_path.exists():
+            continue
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        md = json.loads(metrics_path.read_text(encoding="utf-8"))
+        if meta is None:
+            meta = {"run_label": cfg.get("run_label", ""), "axis": cfg["axis"],
+                    "kp": cfg["kp"], "ki": cfg["ki"], "kd": cfg["kd"]}
+        reps.append({"rep": rep_dir.name, **md})
+    return meta, reps
+
+
+def _aggregate_stat(values):
+    """过滤 None/NaN → (mean, std, n)。n<2→std=0；n==0→全 NaN。"""
+    vals = [float(v) for v in values
+            if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    n = len(vals)
+    if n == 0:
+        return math.nan, math.nan, 0
+    mean = float(np.mean(vals))
+    std = float(np.std(vals, ddof=1)) if n >= 2 else 0.0
+    return mean, std, n
+
+
 def aggregate(sweep_dir: Path) -> Path:
-    """读 sweep_dir/runs/*/metrics.json + config.json，写 sweep_dir/summary.csv。返回 csv 路径。"""
+    """两级聚合 runs/<config>/r<NN>/。写 summary.csv（每配置 mean/std/n）
+    + summary_runs.csv（每 rep 原始值）。返回 summary.csv 路径。"""
     sweep_dir = Path(sweep_dir)
     runs_dir = sweep_dir / "runs"
     if not runs_dir.exists():
         raise FileNotFoundError(f"{runs_dir} not found")
 
-    rows = []
-    for run_dir in sorted(runs_dir.iterdir()):
-        if not run_dir.is_dir():
+    summary_rows, rep_rows = [], []
+    for config_dir in sorted(runs_dir.iterdir()):
+        if not config_dir.is_dir():
             continue
-        cfg_path = run_dir / "config.json"
-        metrics_path = run_dir / "metrics.json"
-        if not cfg_path.exists() or not metrics_path.exists():
+        meta, reps = _rep_metric_values(config_dir)
+        if meta is None or not reps:
             continue
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        metrics_dict = json.loads(metrics_path.read_text(encoding="utf-8"))
-        row = {
-            "run_id": run_dir.name,
-            "run_label": cfg.get("run_label", ""),
-            "axis": cfg["axis"],
-            "kp": cfg["kp"], "ki": cfg["ki"], "kd": cfg["kd"],
-            **{m: metrics_dict.get(m) for m in _ALL_METRIC_NAMES},
-        }
-        rows.append(row)
+        for r in reps:
+            rep_rows.append({
+                "run_id": config_dir.name, "rep": r["rep"],
+                "run_label": meta["run_label"], "axis": meta["axis"],
+                "kp": meta["kp"], "ki": meta["ki"], "kd": meta["kd"],
+                **{m: r.get(m) for m in _ALL_METRIC_NAMES},
+            })
+        row = {"run_id": config_dir.name, "run_label": meta["run_label"],
+               "axis": meta["axis"], "kp": meta["kp"], "ki": meta["ki"], "kd": meta["kd"]}
+        for m in _ALL_METRIC_NAMES:
+            mean, std, n = _aggregate_stat([r.get(m) for r in reps])
+            row[f"{m}_mean"], row[f"{m}_std"], row[f"{m}_n"] = mean, std, n
+        summary_rows.append(row)
 
     summary_path = sweep_dir / "summary.csv"
-    pd.DataFrame(rows).to_csv(summary_path, index=False)
+    pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+    pd.DataFrame(rep_rows).to_csv(sweep_dir / "summary_runs.csv", index=False)
     return summary_path
