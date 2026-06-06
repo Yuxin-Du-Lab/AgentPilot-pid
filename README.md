@@ -17,7 +17,7 @@ cp .env.example .env
 ```
 # 编辑 .env 填入真实的 API_URL_CTRL 和 API_URL_GET
 
-# 2. 起飞，让飞机稳定在某个高度（建议 5000ft, heading 90°, airspeed ~120kt）
+# 2. 起飞，让飞机稳定在某个高度（建议 5000ft, heading 90°）
 
 # 3. 跑 heading 轴 sweep（约 11 分钟）
 py -m pid_exp.sweep --axis heading
